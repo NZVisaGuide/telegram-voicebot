@@ -2,8 +2,6 @@ services:
   - type: web
     name: telegram-bot
     env: python
-    buildCommand: ""
-    startCommand: ./start.sh
-    plan: free
-    branch: main
-    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    pythonVersion: 3.11

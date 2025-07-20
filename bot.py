@@ -1,5 +1,6 @@
-import os
 import logging
+import os
+import subprocess
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -8,102 +9,87 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
-from pydub import AudioSegment
 import whisper
 from openai import OpenAI
+
+import subprocess
+print("🔍 Проверка ffmpeg:")
+print(subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout)
+
 
 # Логи
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Проверка на переменные окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN не задан в переменных окружения.")
-if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY не задан в переменных окружения.")
-
-# Инициализация Whisper (локально)
+# Whisper model
 model = whisper.load_model("base")
 
-# Инициализация OpenRouter
+# OpenRouter API
 openrouter_client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
+    api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1"
 )
 
-# Команда /start
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь мне текст или голосовое сообщение.")
+    await update.message.reply_text("Привет! Отправь мне голосовое сообщение, и я его расшифрую.")
 
-# Обработка текста
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-
-    # Ответ через OpenRouter
-    response = openrouter_client.chat.completions.create(
-        model="mistralai/mistral-7b-instruct",
-        messages=[
-            {"role": "system", "content": "Ты дружелюбный ассистент."},
-            {"role": "user", "content": user_text}
-        ]
-    )
-    answer = response.choices[0].message.content
-    await update.message.reply_text(answer)
-
-# Обработка голосовых сообщений
+# Обработка голосового сообщения
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+
+    # Сохраняем .oga
+    oga_path = "voice.oga"
+    wav_path = "voice.wav"
+    await file.download_to_drive(oga_path)
+
+    # Преобразуем через ffmpeg
     try:
-        voice_file_info = await update.message.voice.get_file()
-        voice_file_bytes = await voice_file_info.download_as_bytearray()
+        subprocess.run([
+            "ffmpeg", "-y", "-i", oga_path, wav_path
+        ], check=True)
+    except subprocess.CalledProcessError:
+        await update.message.reply_text("Ошибка при конвертации аудио.")
+        return
 
-        # Сохраняем файл
-        oga_path = f"voice_{update.message.message_id}.oga"
-        wav_path = f"voice_{update.message.message_id}.wav"
-
-        with open(oga_path, "wb") as f:
-            f.write(voice_file_bytes)
-
-        # Конвертация в WAV
-        audio = AudioSegment.from_file(oga_path)
-        audio.export(wav_path, format="wav")
-
-        # Распознавание речи
+    # Распознаем текст через Whisper
+    try:
         result = model.transcribe(wav_path)
-        recognized_text = result["text"]
-
-        await update.message.reply_text(f"Ты сказал: {recognized_text}")
-
-        # Ответ от OpenRouter
-        response = openrouter_client.chat.completions.create(
-            model="mistralai/mistral-7b-instruct",
-            messages=[
-                {"role": "system", "content": "Ты дружелюбный ассистент."},
-                {"role": "user", "content": recognized_text}
-            ]
-        )
-        answer = response.choices[0].message.content
-        await update.message.reply_text(answer)
-
-        # Удаляем временные файлы
+        text = result["text"]
+        await update.message.reply_text(f"Вы сказали: {text}")
+    except Exception as e:
+        await update.message.reply_text("Ошибка при распознавании.")
+        logger.error(f"Whisper error: {e}")
+    finally:
         os.remove(oga_path)
         os.remove(wav_path)
 
+# Обработка текстовых сообщений
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_message = update.message.text
+
+    try:
+        response = openrouter_client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",
+            messages=[{"role": "user", "content": user_message}]
+        )
+        reply = response.choices[0].message.content
+        await update.message.reply_text(reply)
     except Exception as e:
-        logger.error(f"Ошибка обработки голосового: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке голосового сообщения.")
+        logger.error(f"OpenRouter error: {e}")
+        await update.message.reply_text("Ошибка при обращении к AI.")
 
-# Инициализация Telegram-приложения
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-# Обработчики
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-
-# Запуск
+# Запуск бота
 if __name__ == "__main__":
-    print("Бот запущен...")
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан в переменных окружения")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     app.run_polling()
